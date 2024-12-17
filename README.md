@@ -1,6 +1,6 @@
 # FedSum
 
-PyTorch implementation of FedSum: Data-Efficient Federated Learning under Data Scarcity Scenario for Text Summarization
+PyTorch implementation of FedSum: Data-Efficient Federated Learning under Data Scarcity Scenario for Text Summarization.\n
 Our paper has been accept by AAAI 2025
 
 ## Abstract
