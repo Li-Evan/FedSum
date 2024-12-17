@@ -1,0 +1,268 @@
+import os
+
+import torch
+import numpy as np
+import copy
+import gc
+import math
+from tqdm import tqdm, trange
+from tool.logger import *
+from tool.utils import get_parameters, set_parameters, save_model, Testing_ROUGE
+from algorithm.Optimizers import BERTSUMEXT_Optimizer
+from algorithm.client_selection import client_selection
+# torch.backends.cudnn.enabled = True
+# torch.backends.cudnn.benchmark = True
+
+
+# Federated Average with BERTSUM model
+def Fed_AVG_BERTSUMEXT(device,
+                       global_model,
+                       algorithm_epoch_T, num_clients_K, communication_round_I, FL_fraction, FL_drop_rate,
+                       training_dataloaders,
+                       training_dataset,
+                       client_dataset_list,
+                       param_dict,
+                       testing_dataloader=None):
+    # training_dataset_size = len(training_dataset)
+    if (param_dict["dataset_name"] == "Mixtape"):
+        training_dataset_size = len(training_dataset)
+    else:
+        training_dataset_size = sum(len(_) for _ in training_dataset)
+    client_datasets_size_list = [len(_) for _ in client_dataset_list]
+    average_weight = np.array([float(i / training_dataset_size) for i in client_datasets_size_list])
+
+    # Parameter Initialization
+    local_model_list = [copy.deepcopy(global_model) for _ in range(num_clients_K)]
+
+    criterion = torch.nn.BCELoss(reduction='none')
+
+    # Training process
+    logger.info("Training process begin!")
+    logger.info(f'Training Dataset Size: {training_dataset_size}; Client Datasets Size:{client_datasets_size_list}')
+
+    # TODO:改了迭代的架构，现在有三个for 最外层的for通信轮次 第二层是for每个通信轮次中的客户端训练epoch 第三层是for batch
+    # communication_round_I 是指总的通信轮次
+    for iter_t in range(communication_round_I):
+        # 先选客户端，只对选中的客戶下发模型
+        # Client Selection
+        idxs_users = client_selection(
+            client_num=num_clients_K,
+            fraction=FL_fraction,
+            dataset_size=training_dataset_size,
+            client_dataset_size_list=client_datasets_size_list,
+            drop_rate=FL_drop_rate,
+            style="FedAvg",
+        )
+
+        # 下发模型
+        for id in idxs_users:
+            local_model_list[id] = copy.deepcopy(global_model)
+
+        logger.info(f"*** Communication Round: {iter_t + 1}; Select clients: {idxs_users}; Start Local Training! ***")
+
+        # Simulate Client Parallel
+        for id in idxs_users:
+            # Local Initialization
+            model = local_model_list[id]
+            model.train()
+            model.to(device)
+            # logger.info(f'Max memory usage: {torch.cuda.memory_reserved() / 1024 ** 2} MB')
+            optimizer = BERTSUMEXT_Optimizer(
+                method=param_dict['optimize_method'], learning_rate=param_dict['learning_rate'], max_grad_norm=0)
+            optimizer.set_parameters(list(model.named_parameters()))
+            client_i_dataloader = training_dataloaders[id]
+
+            # Local Training
+            # for epoch in tqdm(range(algorithm_epoch_T), desc="Epoch"):
+            for epoch in range(algorithm_epoch_T):
+                epoch_total_loss = 0
+                average_one_sample_loss_in_epoch = 0
+
+                label_0_total_entropy = 0.0  # 用于存储总的信息熵
+                label_1_total_entropy = 0.0  # 用于存储总的信息熵
+                label_0_count = 0
+                label_1_count = 0
+
+                # 注意：mini-batch gradient descent一般是把整个batch的损失累加起来，然后除以batch内的样本数目
+                # FedAvg算法中，一个batch就更新一次参数
+                for batch_index, batch in enumerate(client_i_dataloader):
+                    # src尺寸：【sub_batch_size，512】
+                    src = batch['src'].to(device)
+                    # labels尺寸：【sub_batch_size，批内最大句子数目】
+                    labels = batch['src_sent_labels'].to(device)
+                    segs = batch['segs'].to(device)
+                    clss = batch['clss'].to(device)
+                    mask = batch['mask_src'].to(device)
+                    mask_cls = batch['mask_cls'].to(device)
+                    sub_batch_size = 16
+                    average_one_sample_loss_in_batch = 0
+                    # 计算信息熵的部件
+                    tmp_label_0_sent_scores_list = []
+                    tmp_label_1_sent_scores_list = []
+
+                    for i in range(0, len(src), sub_batch_size):
+                        sbatch_size = src[i:i + sub_batch_size].shape[0]  # 获取当前批次的样本数量
+                        # tmp_sent_scores尺寸：【sub_batch_size，批内最大句子数目】
+                        # tmp_mask尺寸：【sub_batch_size，批内最大句子数目】
+                        tmp_sent_scores, tmp_mask = model(src[i:i + sbatch_size].reshape(sbatch_size, -1),
+                                                          segs[i:i + sbatch_size].reshape(sbatch_size, -1),
+                                                          clss[i:i + sbatch_size].reshape(sbatch_size, -1),
+                                                          mask[i:i + sbatch_size].reshape(sbatch_size, -1),
+                                                          mask_cls[i:i + sbatch_size].reshape(sbatch_size, -1))
+                        # 注意，criterion函数并没有进行reduction操作，loss的尺寸：【sub_batch_size，sub_batch的大句子数目】
+                        loss = criterion(tmp_sent_scores, labels[i:i + sbatch_size].reshape(sbatch_size, -1).float())
+                        # sub_batch_loss_list.append(loss)  #不要删，这行是表示先不回传小分批loss，最后再一整批loss回传，搭配下面
+
+                        # 为了避免爆显存，先回传loss
+                        loss = torch.sum(loss) / src.shape[0]
+                        average_one_sample_loss_in_batch += loss
+                        loss.backward()
+
+                        # 计算信息熵的部件
+                        sent_scores = tmp_sent_scores + tmp_mask.float()
+                        tmp_label_0_sent_scores_list.append( (sent_scores * (-(labels[i:i + sbatch_size]-1))).cpu().data.numpy() )
+                        tmp_label_1_sent_scores_list.append( (sent_scores * labels[i:i + sbatch_size]).cpu().data.numpy() )
+
+                        # torch.cuda.empty_cache()
+                    average_one_sample_loss_in_epoch += average_one_sample_loss_in_batch / math.ceil(
+                        client_datasets_size_list[id] / param_dict['batch_size'])
+
+                    # 计算信息熵的部件
+                    label_0_sent_scores_list = np.vstack(tmp_label_0_sent_scores_list)
+                    label_1_sent_scores_list = np.vstack(tmp_label_1_sent_scores_list)
+
+                    # 计算info_entropy并保存
+                    label_0_sent_scores = torch.from_numpy(label_0_sent_scores_list)
+                    label_1_sent_scores = torch.from_numpy(label_1_sent_scores_list)
+
+
+                    # 计算有多少个label 0 和 label 1
+                    sent_label_flag = labels.gt(0.5)
+                    for doc_num in range(len(sent_label_flag)):
+                        for _ in sent_label_flag[doc_num]:
+                            if _:
+                                label_1_count += 1
+                            else:
+                                label_0_count += 1
+
+                    # 循环遍历每个维度
+                    for dim in range(label_0_sent_scores.size(0)):
+                        # 从张量中选择当前维度
+                        current_dimension = label_0_sent_scores[dim]
+                        # print(f"current_dimension:{current_dimension}")
+                        # 计算信息熵
+                        non_zero_elements = current_dimension[current_dimension != 0]
+                        non_zero_elements = non_zero_elements - 1
+                        # print(f"non_zero_elements:{non_zero_elements}")
+                        total_probability = sum(non_zero_elements)
+                        probabilities = torch.tensor([prob / total_probability if prob > 0 else 0.000001 for prob in
+                                                      non_zero_elements])  # 计算非零元素的概率分布
+                        # print(f"probabilities:{probabilities}")
+                        entropy = -torch.sum(probabilities * torch.log2(probabilities))  # 计算信息熵
+                        label_0_total_entropy += entropy.item()  # 将信息熵添加到总信息熵中
+
+                    for dim in range(label_1_sent_scores.size(0)):
+                        # 从张量中选择当前维度
+                        current_dimension = label_1_sent_scores[dim]
+                        # print(f"current_dimension:{current_dimension}")
+                        # 计算信息熵
+                        non_zero_elements = current_dimension[current_dimension != 0]
+                        non_zero_elements = non_zero_elements - 1
+                        # print(f"non_zero_elements:{non_zero_elements}")
+                        total_probability = sum(non_zero_elements)
+                        probabilities = torch.tensor([prob / total_probability if prob > 0 else 0.000001 for prob in
+                                                      non_zero_elements])  # 计算非零元素的概率分布
+                        # print(f"probabilities:{probabilities}")
+                        entropy = -torch.sum(probabilities * torch.log2(probabilities))  # 计算信息熵
+                        # entropy = -torch.sum(non_zero_elements * torch.log2(non_zero_elements))  # 计算信息熵
+                        # print(entropy)
+                        label_1_total_entropy += entropy.item()  # 将信息熵添加到总信息熵中
+
+                    # 不要删，这行是表示先不回传小分批loss，最后再一整批loss回传, 搭配上面
+                    # # batch_total_loss的尺寸：【batch_size，sub_batch的大句子数目】
+                    # # batch_total_loss = torch.cat(sub_batch_loss_list, 0)
+                    # # 一整个batch内，平均一个样本的损失
+                    # averaged_one_sample_loss = torch.sum(batch_total_loss) / param_dict['batch_size']
+                    # epoch_total_loss += torch.sum(batch_total_loss)
+                    # # logger.info(f"### Avg one sample's Loss in one batch: {averaged_one_sample_loss}")
+                    # averaged_one_sample_loss.backward()
+
+                    # FedAvg算法一个batch就做一次更新
+                    optimizer.step()
+                    model.zero_grad()
+
+                    del tmp_sent_scores, tmp_mask, src, labels, segs, clss, mask, mask_cls
+                    gc.collect()
+                    # torch.cuda.empty_cache()
+                    # break
+
+                label_0_avg_entropy = label_0_total_entropy / label_0_count  # 将信息熵添加到平均信息熵中
+                label_1_avg_entropy = label_1_total_entropy / label_1_count  # 将信息熵添加到平均信息熵中
+
+                logger.info(f"label_0_total_entropy: {label_0_total_entropy}")
+                logger.info(f"label_1_total_entropy: {label_1_total_entropy}")
+                logger.info(f"label_0_avg_entropy: {label_0_avg_entropy}")
+                logger.info(f"label_1_avg_entropy: {label_1_avg_entropy}")
+
+                # 不要删，这行是表示先不回传小分批loss，最后再一整批loss回传, 搭配上面
+                # average_one_sample_loss_in_epoch = epoch_total_loss / client_datasets_size_list[id]
+
+                logger.info(f"### Communication Round: {iter_t + 1} / {communication_round_I}; "
+                            f"Client: {id} / {num_clients_K}; "
+                            f"Epoch: {epoch + 1}; Avg One Sample's Loss in Epoch: {average_one_sample_loss_in_epoch}  ####")
+
+                # if epoch+1 == (algorithm_epoch_T/2):
+                #     Testing_ROUGE(param_dict, param_dict['device'], testing_dataloader, model,
+                #                   epoch+1, iter_t)
+                #     model.to(device)
+
+                # record_time = math.ceil(algorithm_epoch_T*(0.2 if algorithm_epoch_T > 200 else 0.4))
+                # if (epoch + 1) % record_time == 0:
+                #     logger.info(f"########## Rouge_Testing Epoch: {epoch+1}; "
+                #             f"Client: {id} / {num_clients_K}; ")
+                #     Testing_ROUGE(param_dict, param_dict['device'], testing_dataloader, model,
+                #                        param_dict['algorithm_epoch_T'], param_dict['communication_round_I'])
+
+            # Upgrade the local model list
+            local_model_list[id] = model.cpu()
+            del model
+            # torch.cuda.empty_cache()
+
+        # Communicate
+        logger.info(f"********** Communicate: {(iter_t + 1)} **********")
+
+        # Global operation
+        logger.info("********** Parameter aggregation **********")
+        theta_list = []
+        for id in idxs_users:
+            selected_model = local_model_list[id]
+            theta_list.append(get_parameters(selected_model))
+
+        theta_list = np.array(theta_list, dtype=object)
+        # FedAvg新版论文的聚合权重是数据占比
+        theta_avg = np.average(theta_list, axis=0, weights=[average_weight[j] for j in idxs_users]).tolist()
+        # FedAvg旧版论文的聚合权重是平均
+        # theta_avg = np.mean(theta_list, 0).tolist()
+
+        # save model
+        # set_parameters(global_model, theta_avg)
+        # save_dir = f'../save_path/'
+        # os.makedirs(save_dir, exist_ok=True)
+        # save_path = os.path.join(save_dir, f"global_fedavg_{iter_t}.pth")
+        # torch.save(global_model.state_dict(), save_path)
+        # print("Save FedAvg global model in iter ", iter_t+1)
+
+        if (iter_t + 1) != param_dict['communication_round_I']:
+            logger.info(f"Global model testing at Communication {(iter_t + 1)}")
+            logger.info(f"########## Rouge_Testing Round: {iter_t + 1} / {communication_round_I}; ")
+            Testing_ROUGE(param_dict, param_dict['device'], testing_dataloader, global_model,
+                          param_dict['algorithm_epoch_T'], param_dict['communication_round_I'])
+
+        # Save model
+        # TODO:现在是若干个通信轮次之后统一保存一次global和一次client，有必要的话可以改成在客户端的迭代里面保存，但感觉这个问题不大
+        # if (iter_t) % param_dict["save_checkpoint_rounds"] == 0 and iter_t != 0:
+        #     save_model(param_dict, global_model, local_model_list, iter_t)
+
+    logger.info("Training finish, return global model and local model list")
+    return global_model, local_model_list
+
